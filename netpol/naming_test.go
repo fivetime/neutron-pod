@@ -41,3 +41,39 @@ func TestMessagesNameBothHalvesAndLeakNoEndpoint(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// A controller moving onto this module must find the groups it already has. A name
+// that changed would mint a new group for every policy of every tenant, and creating
+// a security group object is what ovn-northd recomputes the whole region for. A
+// description that changed rewrites every group and orphans it from the sweep.
+// These strings are in production: changing one is a migration, not a refactor.
+func TestExistingGroupsKeepTheirNames(t *testing.T) {
+	kubezun := Naming{Prefix: "knp", Product: "kubezun"}
+	kubetron := Naming{Prefix: "ktn", Product: "kubetron"}
+	for got, want := range map[string]string{
+		kubezun.AllowIngress():          "knp-allow-ingress",
+		kubezun.AllowEgress():           "knp-allow-egress",
+		kubezun.DenyAll():               "knp-deny-all",
+		kubezun.PolicyGroup("ns", "p"):  "knp-policy-75fe947f4ed54540",
+		kubezun.PeerGroup("key"):        "knp-peers-2c70e12b7a0646f9",
+		kubezun.freePrefix():            "knp-free-",
+		kubezun.managedBy():             "kubezun-networkpolicy",
+		kubezun.freeDescription():       "kubezun: free [kubezun-networkpolicy]",
+		kubetron.AllowIngress():         "ktn-allow-ingress",
+		kubetron.AllowEgress():          "ktn-allow-egress",
+		kubetron.DenyAll():              "ktn-deny-all",
+		kubetron.PolicyGroup("ns", "p"): "ktn-policy-75fe947f4ed54540",
+		kubetron.PeerGroup("key"):       "ktn-peers-2c70e12b7a0646f9",
+		kubetron.managedBy():            "kubetron-networkpolicy",
+	} {
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+	if got := kubezun.policyOf("kubezun: what NetworkPolicy ns/p allows"); got != "ns/p" {
+		t.Errorf("a kubezun group reads back as %q", got)
+	}
+	if got := kubetron.policyOf("kubetron: what NetworkPolicy ns/p allows"); got != "ns/p" {
+		t.Errorf("a kubetron group reads back as %q", got)
+	}
+}

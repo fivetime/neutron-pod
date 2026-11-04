@@ -12,7 +12,7 @@ finding the port and deciding when to apply stay in the controller using it.
 |---|---|
 | `Translate` | NetworkPolicy to rules, and a `Refusal` for what cannot be expressed |
 | `PolicyRules`, `IsolationOf` | Rule sets and which directions a policy isolates |
-| `Neutron` | Baseline, anchor and policy groups, address groups, sweep, optional reuse pool |
+| `Neutron` | Baseline, anchor and policy groups, resolver rules, address groups, sweep, optional reuse pool |
 | `Naming` | Whose groups these are; two controllers in a project never touch each other's |
 | `RefusedMessage`, `NotPreparedMessage` | What to tell the tenant, under `EventReason` |
 
@@ -25,3 +25,8 @@ finding the port and deciding when to apply stay in the controller using it.
   naming the backend pods does not admit their Service.
 - Creating or deleting a security group makes ovn-northd recompute. Pace it with
   `Churn`, and leave `Pool` off below ovn-northd 25.09.
+- Group names and descriptions are in production. A changed name mints a new group for
+  every policy of every tenant, so `TestExistingGroupsKeepTheirNames` pins them; changing
+  one is a migration.
+- The anchor's resolver rules are on every port of a tenant, and reconciled for every
+  tenant on a timer. An unchanged answer writes nothing, and writes take a `Churn` token.

@@ -65,6 +65,10 @@ type Neutron struct {
 	// wave of tenants creating a dozen groups each keeps northd busy for
 	// hours. Nil paces nothing. Shared by every tenant one process serves,
 	// because northd's time is shared by every tenant in the region.
+	//
+	// Writes to the anchor's resolver rules take a token too, because a new
+	// resolver address reaches every tenant in one pass; a policy's own rules
+	// do not, they follow what one tenant edits.
 	Churn *rate.Limiter
 
 	// Pool turns released groups into a pool for reuse instead of deleting
@@ -226,12 +230,54 @@ func (n *Neutron) EnsureDenyAll(ctx context.Context) (string, error) {
 // make two anchors, and rules written into one do nothing for ports on the other:
 // DNS silently stays cut off. Seen live.
 func (n *Neutron) SyncResolvers(ctx context.Context, id string, addrs []string) error {
+	want, have, err := n.addResolvers(ctx, id, addrs)
+	if err != nil {
+		return err
+	}
+	for _, r := range have {
+		if !isResolverRule(r) || wantedResolver(want, r) {
+			continue
+		}
+		if err := n.churn(ctx); err != nil {
+			return err
+		}
+		if err := rules.Delete(ctx, n.Client, r.ID).ExtractErr(); err != nil && !isGone(err) {
+			return fmt.Errorf("removing the old resolver %s: %w", r.RemoteIPPrefix, err)
+		}
+	}
+	return nil
+}
+
+// AddResolvers allows DNS to these addresses and removes nothing, for when what
+// is known is only part of the answer.
+func (n *Neutron) AddResolvers(ctx context.Context, id string, addrs []string) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+	_, _, err := n.addResolvers(ctx, id, addrs)
+	return err
+}
+
+// addResolvers writes what is missing, and returns the rules wanted and the rules
+// that were there before.
+//
+// ⚠️ This runs for every tenant on a timer, and the rule is on every port a tenant
+// has, so a write here is never one tenant's cost. Below ovn-northd 25.09 each rule
+// is a full recompute for the region, so a new resolver address reaching every
+// tenant at once would queue them all. Writes take a Churn token and an unchanged
+// answer writes nothing; only the one read of the group's rules is left.
+func (n *Neutron) addResolvers(ctx context.Context, id string, addrs []string) ([]rules.CreateOpts, []rules.SecGroupRule, error) {
 	want := make([]rules.CreateOpts, 0, 2*len(addrs))
+	seen := make(map[netip.Addr]bool, len(addrs))
 	for _, a := range addrs {
 		ip, err := netip.ParseAddr(a)
 		if err != nil {
-			return fmt.Errorf("resolver address %q: %w", a, err)
+			return nil, nil, fmt.Errorf("resolver address %q: %w", a, err)
 		}
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
 		ether := rules.EtherType4
 		if ip.Is6() {
 			ether = rules.EtherType6
@@ -246,25 +292,50 @@ func (n *Neutron) SyncResolvers(ctx context.Context, id string, addrs []string) 
 	}
 	have, err := n.rulesOf(ctx, id)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	for _, w := range want {
 		if hasRule(have, w) {
 			continue
 		}
+		if err := n.churn(ctx); err != nil {
+			return nil, nil, err
+		}
 		if _, err := rules.Create(ctx, n.Client, w).Extract(); err != nil && !isConflict(err) {
-			return fmt.Errorf("allowing the resolver at %s: %w", w.RemoteIPPrefix, err)
+			return nil, nil, fmt.Errorf("allowing the resolver at %s: %w", w.RemoteIPPrefix, err)
 		}
 	}
-	for _, r := range have {
-		if !isResolverRule(r) || wantedResolver(want, r) {
-			continue
-		}
-		if err := rules.Delete(ctx, n.Client, r.ID).ExtractErr(); err != nil && !isGone(err) {
-			return fmt.Errorf("removing the old resolver %s: %w", r.RemoteIPPrefix, err)
+	return want, have, nil
+}
+
+// MetadataAddresses is where a network's metadata port sits, one address per
+// subnet that has one. The port is in the network's own project, so the tenant's
+// credential reads it. A network without the port has no addresses, which is not
+// an error.
+//
+// One filtered read of Neutron per call: ask once per tenant per sync, not per pod.
+func (n *Neutron) MetadataAddresses(ctx context.Context, networkID string) ([]string, error) {
+	pages, err := ports.List(n.Client, ports.ListOpts{
+		NetworkID:   networkID,
+		DeviceOwner: "network:distributed",
+		// The prefix Neutron names its metadata ports with; other distributed
+		// ports on the network, such as a health monitor's, are not this.
+		DeviceID: "ovnmeta-" + networkID,
+	}).AllPages(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing the metadata port of network %s: %w", networkID, err)
+	}
+	found, err := ports.ExtractPorts(pages)
+	if err != nil {
+		return nil, err
+	}
+	var addrs []string
+	for _, p := range found {
+		for _, ip := range p.FixedIPs {
+			addrs = append(addrs, ip.IPAddress)
 		}
 	}
-	return nil
+	return addrs, nil
 }
 
 // isResolverRule recognises what SyncResolvers writes: outbound DNS to one host.
@@ -722,11 +793,12 @@ func (n Naming) policyOf(description string) string {
 // whatever has accumulated instead of once per policy a tenant edits.
 //
 // live is the set of policy references ("namespace/name") that still exist.
-// A group is removed only when this process serves its namespace and the
-// policy is gone: a group whose policy exists but whose pods have all left is
-// kept, because the pods will come back and rebuilding it costs more than
-// leaving it.
-func (n *Neutron) Sweep(ctx context.Context, live map[string]bool, serves func(string) bool) (removed int, err error) {
+// A group is removed only when collectable says its namespace is the caller's to
+// collect and the policy is gone: a group whose policy exists but whose pods have
+// all left is kept, because the pods will come back and rebuilding it costs more
+// than leaving it. Which namespaces are collectable is the caller's decision: the
+// ones it serves, usually also ones it has confirmed deleted.
+func (n *Neutron) Sweep(ctx context.Context, live map[string]bool, collectable func(string) bool) (removed int, err error) {
 	var all []groups.SecGroup
 	err = groups.List(n.Client, groups.ListOpts{}).EachPage(ctx,
 		func(_ context.Context, page pagination.Page) (bool, error) {
@@ -758,7 +830,7 @@ func (n *Neutron) Sweep(ctx context.Context, live map[string]bool, serves func(s
 			continue
 		}
 		namespace, _, ok := strings.Cut(ref, "/")
-		if !ok || !serves(namespace) || live[ref] {
+		if !ok || !collectable(namespace) || live[ref] {
 			continue
 		}
 		doomed[g.ID] = struct{}{}
