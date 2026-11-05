@@ -1,12 +1,18 @@
 # neutron-pod
 
-Kubernetes NetworkPolicy on Neutron ports: translation, rule sets and the Neutron
-calls, for controllers that attach pods to OpenStack tenant networks.
+Shared parts of controllers that attach pods to OpenStack tenant networks.
 
-It holds what does not depend on how a pod reaches its port. Watching policies,
-finding the port and deciding when to apply stay in the controller using it.
+| Package | |
+|---|---|
+| `netpol` | Kubernetes NetworkPolicy on Neutron ports |
+| `l7` | Kubernetes Ingress on Octavia L7 load balancers |
 
-## What is here
+Each holds what does not depend on how a pod reaches its port. Watching objects, finding
+credentials and deciding when to apply stay in the controller using it.
+
+## netpol
+
+### What is here
 
 | | |
 |---|---|
@@ -16,7 +22,7 @@ finding the port and deciding when to apply stay in the controller using it.
 | `Naming` | Whose groups these are; two controllers in a project never touch each other's |
 | `RefusedMessage`, `NotPreparedMessage` | What to tell the tenant, under `EventReason` |
 
-## Semantics to keep in mind
+### Semantics to keep in mind
 
 - A security group is additive and has no deny. Anything not expressible stays denied:
   `ipBlock.except`, named ports and SCTP are refused, never widened.
@@ -30,3 +36,32 @@ finding the port and deciding when to apply stay in the controller using it.
   one is a migration.
 - The anchor's resolver rules are on every port of a tenant, and reconciled for every
   tenant on a timer. An unchanged answer writes nothing, and writes take a `Churn` token.
+
+## l7
+
+### What is here
+
+| | |
+|---|---|
+| `Octavia` | The load balancer calls this package makes. The controller implements it, so how it waits for a load balancer to settle stays its own |
+| `CollectBackends`, `ResolveServicePort`, `PoolName` | Ingress backends and the pools they map to |
+| `EnsureBackendPool`, `GCStalePools` | Pools with their HTTP health monitors, and removing the ones no backend references |
+| `EnsureListener` | The one listener of an Ingress, and removing the protocol it no longer serves |
+| `BuildPolicies`, `SyncPolicies` | Host and path rules as ordered l7policies |
+| `TuningFromAnnotations` | The upstream `octavia.ingress.kubernetes.io/*` listener annotations |
+| `EnsureBarbicanSecret`, `CleanupBarbicanSecrets` | TLS Secrets as PKCS12 bundles in Barbican |
+
+The load balancer itself, members and the floating IP stay in the controller.
+
+### Semantics to keep in mind
+
+- Order within a reconcile: pools, `EnsureListener`, members, `SyncPolicies`, `GCStalePools`.
+  Member changes flip a load balancer to PENDING_UPDATE, and a listener whose TLS ref needs
+  repair cannot wait behind them.
+- Clean up Barbican only after `EnsureListener` holds the new refs. Secrets are immutable and
+  named by content, so rotation creates a new one and re-points the listener first.
+- A policy with no rules matches nothing. `SyncPolicies` treats a live one as drift and rebuilds it.
+- `SyncPolicies` tears down and recreates the whole set on any difference. An unchanged Ingress
+  writes nothing, and `TestSyncPoliciesWritesNothingWhenConverged` holds it to that.
+- Object names are in production. A changed name recreates the objects of every Ingress, so
+  `TestExistingObjectsKeepTheirNames` pins them; changing one is a migration.

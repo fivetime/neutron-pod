@@ -9,6 +9,7 @@ require (
 	golang.org/x/time v0.15.0
 	k8s.io/api v0.36.0
 	k8s.io/apimachinery v0.36.0
+	software.sslmate.com/src/go-pkcs12 v0.7.2
 )
 
 require (
@@ -19,6 +20,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
