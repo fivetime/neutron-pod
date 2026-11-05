@@ -255,7 +255,7 @@ func (f *fakeOctavia) CreateListener(_ context.Context, _ string, o listeners.Cr
 	f.writes = append(f.writes, "create-listener "+o.Name)
 	l := &listeners.Listener{
 		ID: f.id("listener"), Name: o.Name, DefaultPoolID: o.DefaultPoolID,
-		DefaultTlsContainerRef: o.DefaultTlsContainerRef, AllowedCIDRs: o.AllowedCIDRs,
+		DefaultTlsContainerRef: o.DefaultTlsContainerRef, SniContainerRefs: o.SniContainerRefs, AllowedCIDRs: o.AllowedCIDRs,
 	}
 	f.listeners[o.Name] = l
 	return l, nil
@@ -269,6 +269,9 @@ func (f *fakeOctavia) UpdateListener(_ context.Context, _, id string, o listener
 		}
 		if o.DefaultTlsContainerRef != nil {
 			l.DefaultTlsContainerRef = *o.DefaultTlsContainerRef
+		}
+		if o.SniContainerRefs != nil {
+			l.SniContainerRefs = *o.SniContainerRefs
 		}
 		if o.DefaultPoolID != nil {
 			l.DefaultPoolID = *o.DefaultPoolID
@@ -521,5 +524,52 @@ func TestExactPathRoundTripsThroughDriftCheck(t *testing.T) {
 	}
 	if len(f.writes) != 0 {
 		t.Fatalf("an exact path read back as drift: %v", f.writes)
+	}
+}
+
+// CleanupBarbicanSecrets removes every bundle not in tlsRefs. A listener left holding an
+// SNI ref outside tlsRefs points at a deleted secret, and its next update leaves the load
+// balancer stuck in PENDING_UPDATE, undeletable (seen live on incus).
+func TestEnsureListenerKeepsSNIRefsInStepWithTLSRefs(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	open := &Tuning{AllowedCIDRs: []string{}}
+	ensure := func(refs ...string) *listeners.Listener {
+		t.Helper()
+		l, err := EnsureListener(ctx, f, "lb", testLB, refs, "", open)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return l
+	}
+	wantSNI := func(l *listeners.Listener, want ...string) {
+		t.Helper()
+		if !sameSet(l.SniContainerRefs, want) {
+			t.Fatalf("sni = %v, want %v", l.SniContainerRefs, want)
+		}
+	}
+
+	wantSNI(ensure("default", "s2"), "s2")
+
+	// Rotating an SNI certificate is a new ref.
+	wantSNI(ensure("default", "s2-new"), "s2-new")
+	// So is adding one.
+	wantSNI(ensure("default", "s2-new", "s3"), "s2-new", "s3")
+	// And dropping one, down to none: an empty list has to be sent, not omitted.
+	wantSNI(ensure("default", "s3"), "s3")
+	f.writes = nil
+	l := ensure("default")
+	wantSNI(l)
+	if len(f.writes) != 1 {
+		t.Fatalf("writes = %v", f.writes)
+	}
+
+	// Octavia does not promise an order back, and order is not drift.
+	ensure("default", "a", "b")
+	f.listeners[testLB+"_https_443"].SniContainerRefs = []string{"b", "a"}
+	f.writes = nil
+	ensure("default", "a", "b")
+	if len(f.writes) != 0 {
+		t.Fatalf("a reordered SNI list was written: %v", f.writes)
 	}
 }

@@ -392,12 +392,22 @@ func EnsureListener(ctx context.Context, oct Octavia, lbID, lbname string, tlsRe
 		update.DefaultTlsContainerRef = &tlsRefs[0]
 		dirty = true
 	}
+	// SNI refs too, including back to none. CleanupBarbicanSecrets removes every bundle
+	// not in tlsRefs, so a listener left holding an old SNI ref points at a deleted secret.
+	// It stays ACTIVE until its next update, which the provider can never finish: the load
+	// balancer is stuck in PENDING_UPDATE and cannot be deleted.
+	if len(tlsRefs) > 0 {
+		if sni := tlsRefs[1:]; !sameSet(listener.SniContainerRefs, sni) {
+			update.SniContainerRefs = &sni
+			dirty = true
+		}
+	}
 	if listener.DefaultPoolID != defaultPoolID {
 		update.DefaultPoolID = &defaultPoolID
 		dirty = true
 	}
 	// Whitelist: always enforced, including back to empty (see Tuning).
-	if !cidrsEqual(listener.AllowedCIDRs, tuning.AllowedCIDRs) {
+	if !sameSet(listener.AllowedCIDRs, tuning.AllowedCIDRs) {
 		cidrs := tuning.AllowedCIDRs
 		update.AllowedCIDRs = &cidrs
 		dirty = true

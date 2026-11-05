@@ -82,8 +82,8 @@ func TuningFromAnnotations(ing *networkingv1.Ingress) (*Tuning, error) {
 	return t, nil
 }
 
-// cidrsEqual compares two CIDR sets order-insensitively.
-func cidrsEqual(a, b []string) bool {
+// sameSet compares two string sets order-insensitively.
+func sameSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}

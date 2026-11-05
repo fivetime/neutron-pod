@@ -35,7 +35,7 @@ func TestTuningParsesWhitelistAndTimeouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cidrsEqual(got.AllowedCIDRs, []string{"192.168.1.0/24", "10.0.0.0/8"}) {
+	if !sameSet(got.AllowedCIDRs, []string{"192.168.1.0/24", "10.0.0.0/8"}) {
 		t.Fatalf("whitelist = %v", got.AllowedCIDRs)
 	}
 	if got.TimeoutClientData == nil || *got.TimeoutClientData != 50000 {
