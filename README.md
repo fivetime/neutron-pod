@@ -27,8 +27,11 @@ credentials and deciding when to apply stay in the controller using it.
 - A security group is additive and has no deny. Anything not expressible stays denied:
   `ipBlock.except`, named ports and SCTP are refused, never widened.
 - On OVN, a security group judges a connection's first packet before the load balancer
-  rewrites its destination. Egress to a Service needs the Service address, and a policy
-  naming the backend pods does not admit their Service.
+  rewrites its destination, and the packets after it by the address they are rewritten to.
+  So egress through a load balancer has to allow both. Allowing only the VIP connects and
+  then hangs waiting for a response; allowing only the backend pods times out on connect.
+  An Octavia L7 provider's backends are its workers, which the tenant cannot see: allow the
+  VIP subnet on the listener port.
 - Creating or deleting a security group makes ovn-northd recompute. Pace it with
   `Churn`, and leave `Pool` off below ovn-northd 25.09.
 - Group names and descriptions are in production. A changed name mints a new group for
