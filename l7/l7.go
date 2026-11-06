@@ -177,19 +177,39 @@ func BuildPolicies(ing *networkingv1.Ingress, lbname string, poolIDs map[string]
 }
 
 // SyncPolicies converges the listener's l7policies onto desired. Drift detection is
-// whole-set: policies are ordered and few, so on any difference the set is torn down
-// and recreated in order, which is simpler and safer than in-place position surgery.
+// whole-set: policies are ordered and few, so on any difference the set is replaced, which
+// is simpler and safer than in-place position surgery.
+//
+// The replacement is made before it breaks. Octavia shifts later policies down when one
+// is created at a position, so the new set goes in at the front, in order, while the old
+// set keeps serving behind it, and only then is the old set deleted. Tearing down first
+// left the listener with nothing to match while every object was written, each waiting for
+// the load balancer to settle: a rule change answered 503 on every path for about 47
+// seconds with two rules and over two minutes with six, measured on incus.
+//
+// While the new set is being written, a request may still reach the old set: a new
+// policy matches nothing until its rules exist, and the longest paths are written first,
+// so "/" is the last to take over.
+//
+// Only our policies are compared and replaced. Anything else on the listener was made
+// out-of-band, is left alone, and ends up behind ours.
 func SyncPolicies(ctx context.Context, oct Octavia, lbID, listenerID, lbname string, desired []Policy) error {
 	existing, err := oct.ListL7Policies(ctx, listenerID)
 	if err != nil {
 		return fmt.Errorf("listing l7policies: %w", err)
 	}
 	sort.SliceStable(existing, func(i, j int) bool { return existing[i].Position < existing[j].Position })
+	var ours []l7policies.L7Policy
+	for i := range existing {
+		if strings.HasPrefix(existing[i].Name, lbname+"_l7_") {
+			ours = append(ours, existing[i])
+		}
+	}
 
-	match := len(existing) == len(desired)
+	match := len(ours) == len(desired)
 	if match {
-		for i := range existing {
-			got, err := existingSignature(ctx, oct, &existing[i])
+		for i := range ours {
+			got, err := existingSignature(ctx, oct, &ours[i])
 			if err != nil {
 				return err
 			}
@@ -203,16 +223,6 @@ func SyncPolicies(ctx context.Context, oct Octavia, lbID, listenerID, lbname str
 		return nil
 	}
 
-	for i := range existing {
-		// Only our own policies are ours to delete; anything else on the listener
-		// was made out-of-band and is left alone.
-		if !strings.HasPrefix(existing[i].Name, lbname+"_l7_") {
-			continue
-		}
-		if err := oct.DeleteL7Policy(ctx, lbID, existing[i].ID); err != nil {
-			return fmt.Errorf("deleting stale l7policy %s: %w", existing[i].Name, err)
-		}
-	}
 	for i := range desired {
 		d := &desired[i]
 		pol, err := oct.CreateL7Policy(ctx, lbID, l7policies.CreateOpts{
@@ -229,6 +239,13 @@ func SyncPolicies(ctx context.Context, oct Octavia, lbID, listenerID, lbname str
 			if err := oct.CreateL7Rule(ctx, lbID, pol.ID, rule); err != nil {
 				return fmt.Errorf("creating l7rule for %s: %w", d.Name, err)
 			}
+		}
+	}
+	// A failure above leaves both sets on the listener. The old one still serves, and
+	// the next reconcile sees ours differ and replaces both.
+	for i := range ours {
+		if err := oct.DeleteL7Policy(ctx, lbID, ours[i].ID); err != nil {
+			return fmt.Errorf("deleting replaced l7policy %s: %w", ours[i].Name, err)
 		}
 	}
 	return nil

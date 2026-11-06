@@ -64,7 +64,10 @@ The load balancer itself, members and the floating IP stay in the controller.
 - Clean up Barbican only after `EnsureListener` holds the new refs. Secrets are immutable and
   named by content, so rotation creates a new one and re-points the listener first.
 - A policy with no rules matches nothing. `SyncPolicies` treats a live one as drift and rebuilds it.
-- `SyncPolicies` tears down and recreates the whole set on any difference. An unchanged Ingress
-  writes nothing, and `TestSyncPoliciesWritesNothingWhenConverged` holds it to that.
+- `SyncPolicies` replaces the whole set on any difference, new set in front before the old one
+  goes, so a rule change does not stop the listener serving. Each write waits for the load
+  balancer to settle, about 8 seconds on incus, so the change itself takes that long per object.
+  An unchanged Ingress writes nothing, and `TestSyncPoliciesWritesNothingWhenConverged` holds
+  it to that. Policies not named after the Ingress are left alone and end up behind ours.
 - Object names are in production. A changed name recreates the objects of every Ingress, so
   `TestExistingObjectsKeepTheirNames` pins them; changing one is a migration.

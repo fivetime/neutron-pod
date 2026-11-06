@@ -187,6 +187,8 @@ type fakeOctavia struct {
 	writes    []string
 	failList  error
 	seq       int
+	watch     []string // paths observe() records after every policy or rule write
+	seen      []string
 }
 
 func newFake() *fakeOctavia {
@@ -307,11 +309,58 @@ func (f *fakeOctavia) ListL7Rules(_ context.Context, id string) ([]l7policies.Ru
 	return f.rules[id], nil
 }
 
+// CreateL7Policy inserts at the requested position and shifts the rest down, as Octavia's
+// ordering list does (octavia/db/repositories.py, L7PolicyRepository.create).
 func (f *fakeOctavia) CreateL7Policy(_ context.Context, _ string, o l7policies.CreateOpts) (*l7policies.L7Policy, error) {
 	f.writes = append(f.writes, "create-policy "+o.Name)
-	p := l7policies.L7Policy{ID: f.id("policy"), Name: o.Name, RedirectPoolID: o.RedirectPoolID, Position: o.Position}
-	f.policies = append(f.policies, p)
-	return &p, nil
+	p := l7policies.L7Policy{ID: f.id("policy"), Name: o.Name, RedirectPoolID: o.RedirectPoolID}
+	at := int(o.Position) - 1
+	if o.Position == 0 || at > len(f.policies) {
+		at = len(f.policies)
+	}
+	f.policies = append(f.policies[:at], append([]l7policies.L7Policy{p}, f.policies[at:]...)...)
+	f.renumber()
+	f.observe()
+	return &f.policies[at], nil
+}
+
+func (f *fakeOctavia) renumber() {
+	for i := range f.policies {
+		f.policies[i].Position = int32(i + 1)
+	}
+}
+
+// route is what the listener does with a request path: the pool of the first policy, by
+// position, whose rules all match, or "" when none does. A policy without rules matches
+// nothing.
+func (f *fakeOctavia) route(path string) string {
+	for _, p := range f.policies {
+		rules := f.rules[p.ID]
+		if len(rules) == 0 {
+			continue
+		}
+		ok := true
+		for _, r := range rules {
+			if r.RuleType != string(l7policies.TypePath) {
+				continue
+			}
+			if r.CompareType == string(l7policies.CompareTypeEqual) && path != r.Value ||
+				r.CompareType == string(l7policies.CompareTypeStartWith) && !strings.HasPrefix(path, r.Value) {
+				ok = false
+			}
+		}
+		if ok {
+			return p.RedirectPoolID
+		}
+	}
+	return ""
+}
+
+// observe records, after a write, where each watched path goes.
+func (f *fakeOctavia) observe() {
+	for _, path := range f.watch {
+		f.seen = append(f.seen, path+"->"+f.route(path))
+	}
 }
 
 func (f *fakeOctavia) CreateL7Rule(_ context.Context, _, id string, o l7policies.CreateRuleOpts) error {
@@ -319,6 +368,7 @@ func (f *fakeOctavia) CreateL7Rule(_ context.Context, _, id string, o l7policies
 	f.rules[id] = append(f.rules[id], l7policies.Rule{
 		RuleType: string(o.RuleType), CompareType: string(o.CompareType), Value: o.Value,
 	})
+	f.observe()
 	return nil
 }
 
@@ -331,6 +381,8 @@ func (f *fakeOctavia) DeleteL7Policy(_ context.Context, _, id string) error {
 		}
 	}
 	delete(f.rules, id)
+	f.renumber()
+	f.observe()
 	return nil
 }
 
@@ -571,5 +623,97 @@ func TestEnsureListenerKeepsSNIRefsInStepWithTLSRefs(t *testing.T) {
 	ensure("default", "a", "b")
 	if len(f.writes) != 0 {
 		t.Fatalf("a reordered SNI list was written: %v", f.writes)
+	}
+}
+
+// A rule change must not leave a path unrouted while it is written: each write waits for
+// the load balancer to settle, and tearing the set down first answered 503 on every path
+// for 47 seconds with two rules, over two minutes with six.
+func TestSyncPoliciesKeepsServingWhileReplacing(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	old := []Policy{
+		{Name: testLB + "_l7_0", PoolID: "pool-web", Path: "/web", PathType: networkingv1.PathTypePrefix},
+		{Name: testLB + "_l7_1", PoolID: "pool-root", Path: "/", PathType: networkingv1.PathTypePrefix},
+	}
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, old); err != nil {
+		t.Fatal(err)
+	}
+
+	f.watch = []string{"/", "/web/x", "/web2/x"}
+	f.seen = nil
+	desired := []Policy{
+		{Name: testLB + "_l7_0", PoolID: "pool-web", Path: "/web2", PathType: networkingv1.PathTypePrefix},
+		{Name: testLB + "_l7_1", PoolID: "pool-root", Path: "/", PathType: networkingv1.PathTypePrefix},
+	}
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desired); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range f.seen {
+		if strings.HasSuffix(s, "->") {
+			t.Fatalf("a path went unrouted during the change: %s (all: %v)", s, f.seen)
+		}
+	}
+	if f.route("/web2/x") != "pool-web" || f.route("/web/x") != "pool-root" || f.route("/") != "pool-root" {
+		t.Fatalf("after the change: /web2/x->%s /web/x->%s /->%s", f.route("/web2/x"), f.route("/web/x"), f.route("/"))
+	}
+	if len(f.policies) != 2 {
+		t.Fatalf("old policies left behind: %+v", f.policies)
+	}
+
+	// Converged: names and positions are what the drift check expects, so nothing is written.
+	f.writes = nil
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desired); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("a converged listener was written: %v", f.writes)
+	}
+}
+
+// A policy made by hand on the listener is neither ours to compare nor to delete. Counting
+// it made every reconcile see drift and rebuild the whole set.
+func TestSyncPoliciesConvergesBesideAForeignPolicy(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	f.policies = []l7policies.L7Policy{{ID: "theirs", Name: "by-hand", Position: 1}}
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desiredRootAndAPI()); err != nil {
+		t.Fatal(err)
+	}
+	f.writes = nil
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desiredRootAndAPI()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("a foreign policy made a converged listener look drifted: %v", f.writes)
+	}
+	if f.policies[len(f.policies)-1].ID != "theirs" {
+		t.Fatalf("the foreign policy is not behind ours: %+v", f.policies)
+	}
+}
+
+// A replacement that failed half-way leaves both sets. The next sync replaces both.
+func TestSyncPoliciesRecoversFromAHalfWrittenReplacement(t *testing.T) {
+	ctx := context.Background()
+	f := newFake()
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desiredRootAndAPI()); err != nil {
+		t.Fatal(err)
+	}
+	// One stray new policy at the front, as if the process died after creating it.
+	if _, err := f.CreateL7Policy(ctx, "lb", l7policies.CreateOpts{Name: testLB + "_l7_0", RedirectPoolID: "pool-new", Position: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desiredRootAndAPI()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.policies) != 2 {
+		t.Fatalf("policies = %+v", f.policies)
+	}
+	f.writes = nil
+	if err := SyncPolicies(ctx, f, "lb", "l", testLB, desiredRootAndAPI()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("not converged: %v", f.writes)
 	}
 }
